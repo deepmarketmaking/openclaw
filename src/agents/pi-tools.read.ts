@@ -339,6 +339,8 @@ type RequiredParamGroup = {
   label?: string;
 };
 
+const workspaceMutationLocks = new Map<string, Promise<void>>();
+
 const RETRY_GUIDANCE_SUFFIX = " Supply correct parameters before retrying.";
 
 function parameterValidationError(message: string): Error {
@@ -557,6 +559,40 @@ export function wrapToolParamNormalization(
   };
 }
 
+export function wrapToolMutationLock(tool: AnyAgentTool, root: string): AnyAgentTool {
+  return {
+    ...tool,
+    execute: async (toolCallId, params, signal, onUpdate) => {
+      const normalized = normalizeToolParams(params);
+      const record =
+        normalized ??
+        (params && typeof params === "object" ? (params as Record<string, unknown>) : undefined);
+      const filePathRaw = record?.path;
+      if (typeof filePathRaw !== "string" || !filePathRaw.trim()) {
+        return tool.execute(toolCallId, params, signal, onUpdate);
+      }
+
+      const lockKey = path.resolve(root, filePathRaw);
+      const previous = workspaceMutationLocks.get(lockKey) ?? Promise.resolve();
+      let release: (() => void) | undefined;
+      const current = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      workspaceMutationLocks.set(lockKey, current);
+
+      await previous;
+      try {
+        return await tool.execute(toolCallId, params, signal, onUpdate);
+      } finally {
+        release?.();
+        if (workspaceMutationLocks.get(lockKey) === current) {
+          workspaceMutationLocks.delete(lockKey);
+        }
+      }
+    },
+  };
+}
+
 export function wrapToolWorkspaceRootGuard(tool: AnyAgentTool, root: string): AnyAgentTool {
   return wrapToolWorkspaceRootGuardWithOptions(tool, root);
 }
@@ -662,14 +698,20 @@ export function createSandboxedWriteTool(params: SandboxToolParams) {
   const base = createWriteTool(params.root, {
     operations: createSandboxWriteOperations(params),
   }) as unknown as AnyAgentTool;
-  return wrapToolParamNormalization(base, CLAUDE_PARAM_GROUPS.write);
+  return wrapToolMutationLock(
+    wrapToolParamNormalization(base, CLAUDE_PARAM_GROUPS.write),
+    params.root,
+  );
 }
 
 export function createSandboxedEditTool(params: SandboxToolParams) {
   const base = createEditTool(params.root, {
     operations: createSandboxEditOperations(params),
   }) as unknown as AnyAgentTool;
-  return wrapToolParamNormalization(base, CLAUDE_PARAM_GROUPS.edit);
+  return wrapToolMutationLock(
+    wrapToolParamNormalization(base, CLAUDE_PARAM_GROUPS.edit),
+    params.root,
+  );
 }
 
 export function createHostWorkspaceWriteTool(root: string, options?: { workspaceOnly?: boolean }) {
