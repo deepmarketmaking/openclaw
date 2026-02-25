@@ -142,18 +142,18 @@ ffmpeg -y -i trimmed.mp4 -t END_TIME \
 
 ## QA Loop (Mandatory)
 
-Before sharing any draft, **watch the rendered video end-to-end** (do not rely only on transcript/timestamps).
+Before sharing any draft, **play the rendered video end-to-end in an actual player** (browser/mpv/etc), not only via transcript/timestamp checks.
 
 Minimum checks:
 
 1. Hook starts correctly (e.g., interviewer question is actually audible if requested)
 2. Active speaker crop is correct at each speaker turn
-3. No panel-divider artifacts or mis-centered faces
-4. Captions are short, readable, and not covering faces (keep near bottom)
+3. Framing has proper headroom (no top-of-head clipping) and no panel-divider artifacts
+4. Captions are short, readable, and not covering faces (keep near bottom safe zone)
 5. Audio is continuous and intelligible from start to end (no dropouts/silence)
 6. End cut feels complete (no clipped last word)
 
-If any check fails, re-cut and re-render, then re-watch. Repeat until all checks pass.
+If any check fails, re-cut and re-render, then re-watch in player. Repeat until all checks pass.
 
 ## Duration Target
 
