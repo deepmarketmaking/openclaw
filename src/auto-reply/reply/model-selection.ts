@@ -31,6 +31,7 @@ type ModelSelectionState = {
   allowedModelKeys: Set<string>;
   allowedModelCatalog: ModelCatalog;
   resetModelOverride: boolean;
+  clearedModelRef?: string;
   resolveDefaultThinkingLevel: () => Promise<ThinkLevel>;
   needsModelCatalog: boolean;
 };
@@ -304,6 +305,7 @@ export async function createModelSelectionState(params: {
   let allowedModelCatalog: ModelCatalog = [];
   let modelCatalog: ModelCatalog | null = null;
   let resetModelOverride = false;
+  let clearedModelRef: string | undefined;
 
   if (needsModelCatalog) {
     modelCatalog = await loadModelCatalog({ config: cfg });
@@ -336,6 +338,35 @@ export async function createModelSelectionState(params: {
           }
         }
         resetModelOverride = updated;
+      }
+    }
+  }
+
+  // Clear override if provider's auth profile has persistent failures (errorCount >= 2)
+  if (sessionEntry && sessionStore && sessionKey && !resetModelOverride && hasStoredOverride) {
+    const overrideProvider = sessionEntry.providerOverride?.trim() || defaultProvider;
+    if (overrideProvider !== defaultProvider) {
+      const { ensureAuthProfileStore } = await import("../../agents/auth-profiles.js");
+      const authStore = ensureAuthProfileStore(undefined, { allowKeychainPrompt: false });
+      const profileId = sessionEntry.authProfileOverride ?? `${overrideProvider}:default`;
+      const profileStats = authStore.usageStats?.[profileId];
+      const FAILURE_THRESHOLD = 2;
+      if ((profileStats?.errorCount ?? 0) >= FAILURE_THRESHOLD) {
+        const ref = `${overrideProvider}/${sessionEntry.modelOverride ?? ""}`.replace(/\/$/, "");
+        const { updated } = applyModelOverrideToSessionEntry({
+          entry: sessionEntry,
+          selection: { provider: defaultProvider, model: defaultModel, isDefault: true },
+        });
+        if (updated) {
+          sessionStore[sessionKey] = sessionEntry;
+          if (storePath) {
+            await updateSessionStore(storePath, (store) => {
+              store[sessionKey] = sessionEntry;
+            });
+          }
+          resetModelOverride = true;
+          clearedModelRef = ref;
+        }
       }
     }
   }
@@ -403,6 +434,7 @@ export async function createModelSelectionState(params: {
     allowedModelKeys,
     allowedModelCatalog,
     resetModelOverride,
+    clearedModelRef,
     resolveDefaultThinkingLevel,
     needsModelCatalog,
   };

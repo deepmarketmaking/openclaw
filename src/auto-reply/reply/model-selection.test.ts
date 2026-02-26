@@ -5,11 +5,27 @@ import { createModelSelectionState } from "./model-selection.js";
 vi.mock("../../agents/model-catalog.js", () => ({
   loadModelCatalog: vi.fn(async () => [
     { provider: "anthropic", id: "claude-opus-4-5", name: "Claude Opus 4.5" },
+    { provider: "blockrun", id: "sonnet", name: "Blockrun Sonnet" },
+    { provider: "blockrun", id: "opus", name: "Blockrun Opus" },
     { provider: "inferencer", id: "deepseek-v3-4bit-mlx", name: "DeepSeek V3" },
     { provider: "kimi-coding", id: "k2p5", name: "Kimi K2.5" },
     { provider: "openai", id: "gpt-4o-mini", name: "GPT-4o mini" },
     { provider: "openai", id: "gpt-4o", name: "GPT-4o" },
   ]),
+}));
+
+const mockEnsureAuthProfileStore = vi.hoisted(() =>
+  vi.fn(() => ({ profiles: {}, usageStats: {} as Record<string, { errorCount: number }> })),
+);
+
+vi.mock("../../agents/auth-profiles.js", () => ({
+  ensureAuthProfileStore: mockEnsureAuthProfileStore,
+}));
+
+const mockUpdateSessionStore = vi.hoisted(() => vi.fn(async () => {}));
+
+vi.mock("../../config/sessions.js", () => ({
+  updateSessionStore: mockUpdateSessionStore,
 }));
 
 const makeEntry = (overrides: Record<string, unknown> = {}) => ({
@@ -262,5 +278,177 @@ describe("createModelSelectionState respects session model override", () => {
 
     expect(state.provider).toBe(defaultProvider);
     expect(state.model).toBe("deepseek-v3-4bit-mlx");
+  });
+});
+
+describe("createModelSelectionState auto-clears override on provider failure", () => {
+  const defaultProvider = "openai";
+  const defaultModel = "gpt-4o-mini";
+  const sessionKey = "agent:main:telegram:dm:42";
+
+  async function resolveState(params: {
+    sessionEntry: ReturnType<typeof makeEntry>;
+    sessionStore?: Record<string, ReturnType<typeof makeEntry>>;
+    usageStats?: Record<string, { errorCount: number }>;
+    storePath?: string;
+  }) {
+    mockEnsureAuthProfileStore.mockReturnValue({
+      profiles: {},
+      usageStats: params.usageStats ?? {},
+    });
+    const entry = params.sessionEntry;
+    const store = params.sessionStore ?? { [sessionKey]: entry };
+    const cfg = {} as OpenClawConfig;
+    return createModelSelectionState({
+      cfg,
+      agentCfg: undefined,
+      sessionEntry: entry,
+      sessionStore: store,
+      sessionKey,
+      defaultProvider,
+      defaultModel,
+      provider: defaultProvider,
+      model: defaultModel,
+      hasModelDirective: false,
+      storePath: params.storePath,
+    });
+  }
+
+  it("clears override and sets clearedModelRef when provider errorCount >= 2", async () => {
+    const sessionEntry = makeEntry({
+      providerOverride: "blockrun",
+      modelOverride: "sonnet",
+    });
+
+    const state = await resolveState({
+      sessionEntry,
+      usageStats: { "blockrun:default": { errorCount: 2 } },
+    });
+
+    expect(state.clearedModelRef).toBe("blockrun/sonnet");
+    expect(state.resetModelOverride).toBe(true);
+    expect(state.provider).toBe(defaultProvider);
+    expect(state.model).toBe(defaultModel);
+    expect(sessionEntry.providerOverride).toBeUndefined();
+    expect(sessionEntry.modelOverride).toBeUndefined();
+  });
+
+  it("does not clear when errorCount is below threshold", async () => {
+    const sessionEntry = makeEntry({
+      providerOverride: "blockrun",
+      modelOverride: "sonnet",
+    });
+
+    const state = await resolveState({
+      sessionEntry,
+      usageStats: { "blockrun:default": { errorCount: 1 } },
+    });
+
+    expect(state.clearedModelRef).toBeUndefined();
+    expect(state.resetModelOverride).toBe(false);
+    expect(state.provider).toBe("blockrun");
+    expect(state.model).toBe("sonnet");
+    expect(sessionEntry.providerOverride).toBe("blockrun");
+    expect(sessionEntry.modelOverride).toBe("sonnet");
+  });
+
+  it("does not clear when override provider matches default provider", async () => {
+    const sessionEntry = makeEntry({
+      providerOverride: defaultProvider,
+      modelOverride: "gpt-4o",
+    });
+
+    const state = await resolveState({
+      sessionEntry,
+      usageStats: { "openai:default": { errorCount: 10 } },
+    });
+
+    expect(state.clearedModelRef).toBeUndefined();
+    expect(state.provider).toBe(defaultProvider);
+    expect(state.model).toBe("gpt-4o");
+  });
+
+  it("does not clear when no override is set", async () => {
+    const sessionEntry = makeEntry();
+
+    const state = await resolveState({
+      sessionEntry,
+      usageStats: { "blockrun:default": { errorCount: 10 } },
+    });
+
+    expect(state.clearedModelRef).toBeUndefined();
+    expect(state.resetModelOverride).toBe(false);
+  });
+
+  it("also clears authProfileOverride fields when clearing model override", async () => {
+    const sessionEntry = makeEntry({
+      providerOverride: "blockrun",
+      modelOverride: "sonnet",
+      authProfileOverride: "blockrun:default",
+      authProfileOverrideSource: "user",
+      authProfileOverrideCompactionCount: 3,
+    });
+
+    await resolveState({
+      sessionEntry,
+      usageStats: { "blockrun:default": { errorCount: 2 } },
+    });
+
+    expect(sessionEntry.authProfileOverride).toBeUndefined();
+    expect(sessionEntry.authProfileOverrideSource).toBeUndefined();
+    expect(sessionEntry.authProfileOverrideCompactionCount).toBeUndefined();
+  });
+
+  it("uses explicit authProfileOverride as the profile lookup key", async () => {
+    const sessionEntry = makeEntry({
+      providerOverride: "blockrun",
+      modelOverride: "opus",
+      authProfileOverride: "blockrun:secondary",
+    });
+
+    const state = await resolveState({
+      sessionEntry,
+      usageStats: {
+        "blockrun:default": { errorCount: 0 },
+        "blockrun:secondary": { errorCount: 2 },
+      },
+    });
+
+    expect(state.clearedModelRef).toBe("blockrun/opus");
+  });
+
+  it("persists the cleared session entry via updateSessionStore when storePath is provided", async () => {
+    mockUpdateSessionStore.mockClear();
+    const sessionEntry = makeEntry({
+      providerOverride: "blockrun",
+      modelOverride: "sonnet",
+    });
+
+    await resolveState({
+      sessionEntry,
+      usageStats: { "blockrun:default": { errorCount: 2 } },
+      storePath: "/tmp/test-sessions.json",
+    });
+
+    expect(mockUpdateSessionStore).toHaveBeenCalledOnce();
+    expect(mockUpdateSessionStore).toHaveBeenCalledWith(
+      "/tmp/test-sessions.json",
+      expect.any(Function),
+    );
+  });
+
+  it("does not call updateSessionStore when storePath is not provided", async () => {
+    mockUpdateSessionStore.mockClear();
+    const sessionEntry = makeEntry({
+      providerOverride: "blockrun",
+      modelOverride: "sonnet",
+    });
+
+    await resolveState({
+      sessionEntry,
+      usageStats: { "blockrun:default": { errorCount: 2 } },
+    });
+
+    expect(mockUpdateSessionStore).not.toHaveBeenCalled();
   });
 });

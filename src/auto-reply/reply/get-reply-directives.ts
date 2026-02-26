@@ -444,7 +444,17 @@ export async function resolveReplyDirectives(params: {
   provider = applyResult.provider;
   model = applyResult.model;
   contextTokens = applyResult.contextTokens;
-  const { directiveAck, perMessageQueueMode, perMessageQueueOptions } = applyResult;
+  let { directiveAck } = applyResult;
+  const { perMessageQueueMode, perMessageQueueOptions } = applyResult;
+
+  // If a stuck session model override was auto-cleared, notify the user inline
+  if (modelState.clearedModelRef) {
+    const notice = `\u26a0\ufe0f The pinned model (${modelState.clearedModelRef}) was unavailable and has been cleared. Continuing on the fallback schedule.`;
+    directiveAck = directiveAck?.text
+      ? { ...directiveAck, text: `${notice}\n${directiveAck.text}` }
+      : { text: notice };
+  }
+
   const execOverrides = resolveExecOverrides({ directives, sessionEntry });
 
   return {
