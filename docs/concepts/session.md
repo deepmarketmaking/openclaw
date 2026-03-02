@@ -71,6 +71,199 @@ All session state is **owned by the gateway** (the “master” OpenClaw). UI cl
 - Session entries include `origin` metadata (label + routing hints) so UIs can explain where a session came from.
 - OpenClaw does **not** read legacy Pi/Tau session folders.
 
+## Shared workspace locking
+
+OpenClaw has two lock layers for shared-workspace concurrency:
+
+1. **Session transcript locking** (always on): protects JSONL/session-store writes.
+2. **Workspace mutation locking** (optional): serializes `write`/`edit` tool mutations per target path.
+
+Enable optional workspace mutation locking:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "sharedWorkspaceLocking": {
+        "enabled": true
+      }
+    }
+  }
+}
+```
+
+When multiple runs can touch the same session transcript (for example queued followups, compaction, or concurrent workers on a shared workspace), OpenClaw uses a per-session lock file to serialize writes.
+
+- Lock file path: `<sessionFile>.lock` (for example `.../sessions/<SessionId>.jsonl.lock`).
+- Lock payload: JSON with `pid` and `createdAt`.
+- Lock scope: one lock per normalized session file path (symlink/realpath-aware), with in-process reentrant reference counting by default.
+
+### Behavior
+
+- Lock acquisition uses exclusive create (`wx`): only one writer process can hold the lock file.
+- While held, writes are serialized for that session transcript.
+- Reentrant calls in the same process (same normalized file) share the held lock and increment a counter.
+- The lock file is removed only after the final `release()` for that in-process lock owner.
+
+### Contention behavior
+
+If a lock already exists:
+
+1. OpenClaw inspects lock metadata (`pid`, `createdAt`).
+2. If the lock appears stale, it reclaims the file and retries immediately.
+3. Otherwise it backs off (`min(1000ms, 50ms * attempt)`) and retries until timeout.
+
+Timeout error format:
+
+- `session file locked (timeout <timeoutMs>ms): pid=<pid>|unknown <lockPath>`
+
+### TTL / timeout defaults
+
+Current defaults in `session-write-lock` are:
+
+- Acquire timeout: **10s** (`timeoutMs`, unless caller overrides)
+- Stale threshold: **30m** (`staleMs`)
+- In-process max hold watchdog threshold: **5m** (`maxHoldMs`)
+- Watchdog check interval: **60s**
+- Max-hold grace helper: `resolveSessionLockMaxHoldFromTimeout(timeoutMs + 2m grace, min 5m)`
+
+In the main run/compaction paths, OpenClaw derives `maxHoldMs` from the agent timeout to reduce false stale releases during long runs.
+
+### Stale lock cleanup
+
+OpenClaw cleans stale `.jsonl.lock` files in two places:
+
+- **Gateway startup**: scans all agent `sessions/` dirs and removes stale lock files.
+- **Doctor checks**: `openclaw doctor` reports lock health; `openclaw doctor --fix` removes stale lock files.
+
+Stale criteria include:
+
+- missing `pid`
+- dead `pid`
+- invalid `createdAt`
+- lock older than `staleMs`
+
+For lock files with weak metadata (for example missing pid + invalid timestamp), OpenClaw falls back to lock-file `mtime` age before reclaiming.
+
+### Knobs (for integrators / internal callers)
+
+`acquireSessionWriteLock(...)` supports:
+
+- `timeoutMs`
+- `staleMs`
+- `maxHoldMs`
+- `allowReentrant` (default `true`)
+
+`cleanStaleLockFiles(...)` supports:
+
+- `staleMs`
+- `removeStale` (dry-run vs repair)
+- `nowMs` and optional logging hooks
+
+## Maintenance
+
+OpenClaw applies session-store maintenance to keep `sessions.json` and transcript artifacts bounded over time.
+
+### Defaults
+
+- `session.maintenance.mode`: `warn`
+- `session.maintenance.pruneAfter`: `30d`
+- `session.maintenance.maxEntries`: `500`
+- `session.maintenance.rotateBytes`: `10mb`
+- `session.maintenance.resetArchiveRetention`: defaults to `pruneAfter` (`30d`)
+- `session.maintenance.maxDiskBytes`: unset (disabled)
+- `session.maintenance.highWaterBytes`: defaults to `80%` of `maxDiskBytes` when budgeting is enabled
+
+### How it works
+
+Maintenance runs during session-store writes, and you can trigger it on demand with `openclaw sessions cleanup`.
+
+- `mode: "warn"`: reports what would be evicted but does not mutate entries/transcripts.
+- `mode: "enforce"`: applies cleanup in this order:
+  1. prune stale entries older than `pruneAfter`
+  2. cap entry count to `maxEntries` (oldest first)
+  3. archive transcript files for removed entries that are no longer referenced
+  4. purge old `*.deleted.<timestamp>` and `*.reset.<timestamp>` archives by retention policy
+  5. rotate `sessions.json` when it exceeds `rotateBytes`
+  6. if `maxDiskBytes` is set, enforce disk budget toward `highWaterBytes` (oldest artifacts first, then oldest sessions)
+
+### Performance caveat for large stores
+
+Large session stores are common in high-volume setups. Maintenance work is write-path work, so very large stores can increase write latency.
+
+What increases cost most:
+
+- very high `session.maintenance.maxEntries` values
+- long `pruneAfter` windows that keep stale entries around
+- many transcript/archive artifacts in `~/.openclaw/agents/<agentId>/sessions/`
+- enabling disk budgets (`maxDiskBytes`) without reasonable pruning/cap limits
+
+What to do:
+
+- use `mode: "enforce"` in production so growth is bounded automatically
+- set both time and count limits (`pruneAfter` + `maxEntries`), not just one
+- set `maxDiskBytes` + `highWaterBytes` for hard upper bounds in large deployments
+- keep `highWaterBytes` meaningfully below `maxDiskBytes` (default is 80%)
+- run `openclaw sessions cleanup --dry-run --json` after config changes to verify projected impact before enforcing
+- for frequent active sessions, pass `--active-key` when running manual cleanup
+
+### Customize examples
+
+Use a conservative enforce policy:
+
+```json5
+{
+  session: {
+    maintenance: {
+      mode: "enforce",
+      pruneAfter: "45d",
+      maxEntries: 800,
+      rotateBytes: "20mb",
+      resetArchiveRetention: "14d",
+    },
+  },
+}
+```
+
+Enable a hard disk budget for the sessions directory:
+
+```json5
+{
+  session: {
+    maintenance: {
+      mode: "enforce",
+      maxDiskBytes: "1gb",
+      highWaterBytes: "800mb",
+    },
+  },
+}
+```
+
+Tune for larger installs (example):
+
+```json5
+{
+  session: {
+    maintenance: {
+      mode: "enforce",
+      pruneAfter: "14d",
+      maxEntries: 2000,
+      rotateBytes: "25mb",
+      maxDiskBytes: "2gb",
+      highWaterBytes: "1.6gb",
+    },
+  },
+}
+```
+
+Preview or force maintenance from CLI:
+
+```bash
+openclaw sessions cleanup --dry-run
+openclaw sessions cleanup --enforce
+```
+
+
 ## Session pruning
 
 OpenClaw trims **old tool results** from the in-memory context right before LLM calls by default.
@@ -180,7 +373,7 @@ Runtime override (owner only):
 - `openclaw gateway call sessions.list --params '{}'` — fetch sessions from the running gateway (use `--url`/`--token` for remote gateway access).
 - Send `/status` as a standalone message in chat to see whether the agent is reachable, how much of the session context is used, current thinking/verbose toggles, and when your WhatsApp web creds were last refreshed (helps spot relink needs).
 - Send `/context list` or `/context detail` to see what’s in the system prompt and injected workspace files (and the biggest context contributors).
-- Send `/stop` as a standalone message to abort the current run, clear queued followups for that session, and stop any sub-agent runs spawned from it (the reply includes the stopped count).
+- Send `/stop` (or standalone abort phrases like `stop`, `stop action`, `stop run`, `stop openclaw`) to abort the current run, clear queued followups for that session, and stop any sub-agent runs spawned from it (the reply includes the stopped count).
 - Send `/compact` (optional instructions) as a standalone message to summarize older context and free up window space. See [/concepts/compaction](/concepts/compaction).
 - JSONL transcripts can be opened directly to review full turns.
 

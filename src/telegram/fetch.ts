@@ -1,5 +1,6 @@
 import * as dns from "node:dns";
 import * as net from "node:net";
+import { EnvHttpProxyAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
 import type { TelegramNetworkConfig } from "../config/types.telegram.js";
 import { resolveFetch } from "../infra/fetch.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
@@ -10,7 +11,31 @@ import {
 
 let appliedAutoSelectFamily: boolean | null = null;
 let appliedDnsResultOrder: string | null = null;
+let appliedGlobalDispatcherAutoSelectFamily: boolean | null = null;
 const log = createSubsystemLogger("telegram/network");
+const PROXY_ENV_KEYS = [
+  "HTTPS_PROXY",
+  "HTTP_PROXY",
+  "ALL_PROXY",
+  "https_proxy",
+  "http_proxy",
+  "all_proxy",
+] as const;
+
+function hasProxyEnvConfigured(): boolean {
+  for (const key of PROXY_ENV_KEYS) {
+    const value = process.env[key];
+    if (typeof value === "string" && value.trim().length > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isProxyLikeDispatcher(dispatcher: unknown): boolean {
+  const ctorName = (dispatcher as { constructor?: { name?: string } })?.constructor?.name;
+  return typeof ctorName === "string" && ctorName.includes("ProxyAgent");
+}
 
 // Node 22 workaround: enable autoSelectFamily to allow IPv4 fallback on broken IPv6 networks.
 // Many networks have IPv6 configured but not routed, causing "Network is unreachable" errors.
@@ -27,6 +52,38 @@ function applyTelegramNetworkWorkarounds(network?: TelegramNetworkConfig): void 
         log.info(`autoSelectFamily=${autoSelectDecision.value}${label}`);
       } catch {
         // ignore if unsupported by the runtime
+      }
+    }
+  }
+
+  // Node 22's built-in globalThis.fetch uses undici's internal Agent whose
+  // connect options are frozen at construction time. Calling
+  // net.setDefaultAutoSelectFamily() after that agent is created has no
+  // effect on it. Replace the global dispatcher with one that carries the
+  // current autoSelectFamily setting so subsequent globalThis.fetch calls
+  // inherit the same decision.
+  // See: https://github.com/openclaw/openclaw/issues/25676
+  if (
+    autoSelectDecision.value !== null &&
+    autoSelectDecision.value !== appliedGlobalDispatcherAutoSelectFamily
+  ) {
+    const existingGlobalDispatcher = getGlobalDispatcher();
+    const shouldPreserveExistingProxy =
+      isProxyLikeDispatcher(existingGlobalDispatcher) && !hasProxyEnvConfigured();
+    if (!shouldPreserveExistingProxy) {
+      try {
+        setGlobalDispatcher(
+          new EnvHttpProxyAgent({
+            connect: {
+              autoSelectFamily: autoSelectDecision.value,
+              autoSelectFamilyAttemptTimeout: 300,
+            },
+          }),
+        );
+        appliedGlobalDispatcherAutoSelectFamily = autoSelectDecision.value;
+        log.info(`global undici dispatcher autoSelectFamily=${autoSelectDecision.value}`);
+      } catch {
+        // ignore if setGlobalDispatcher is unavailable
       }
     }
   }
@@ -68,4 +125,5 @@ export function resolveTelegramFetch(
 export function resetTelegramFetchStateForTests(): void {
   appliedAutoSelectFamily = null;
   appliedDnsResultOrder = null;
+  appliedGlobalDispatcherAutoSelectFamily = null;
 }
