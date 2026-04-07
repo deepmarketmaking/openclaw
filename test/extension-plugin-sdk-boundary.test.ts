@@ -1,3 +1,5 @@
+import { execFileSync } from "node:child_process";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   collectExtensionPluginSdkBoundaryInventory,
@@ -15,6 +17,18 @@ const relativeOutsidePackageInventoryPromise = collectExtensionPluginSdkBoundary
 const srcOutsideJsonOutputPromise = getJsonOutput("src-outside-plugin-sdk");
 const pluginSdkInternalJsonOutputPromise = getJsonOutput("plugin-sdk-internal");
 const relativeOutsidePackageJsonOutputPromise = getJsonOutput("relative-outside-package");
+
+function runScript(relativeScriptPath: string): string {
+  return execFileSync(
+    process.execPath,
+    ["--import", "tsx", path.join(process.cwd(), relativeScriptPath)],
+    {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      env: process.env,
+    },
+  );
+}
 
 async function getJsonOutput(
   mode: Parameters<typeof collectExtensionPluginSdkBoundaryInventory>[0],
@@ -72,5 +86,19 @@ describe("extension relative-outside-package boundary inventory", () => {
     expect(jsonResult.exitCode).toBe(0);
     expect(jsonResult.stderr).toBe("");
     expect(jsonResult.json).toEqual([]);
+  });
+});
+
+describe("bundled extension plugin-sdk guard regressions", () => {
+  it("keeps bundled extensions off legacy monolithic plugin-sdk entrypoints", () => {
+    expect(runScript("scripts/check-no-monolithic-plugin-sdk-entry-imports.ts")).toContain(
+      "OK: bundled plugin source files use scoped plugin-sdk subpaths",
+    );
+  });
+
+  it("keeps production extension files off direct repo src imports", () => {
+    expect(runScript("scripts/check-no-extension-src-imports.ts")).toContain(
+      "OK: production extension files avoid direct repo src/ imports",
+    );
   });
 });
